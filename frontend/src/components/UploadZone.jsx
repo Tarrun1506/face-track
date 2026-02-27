@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 
-export default function UploadZone({ label, accept, icon, onFileSelect, preview, fileName }) {
+export default function UploadZone({ label, accept, icon, onFileSelect, preview, fileName, isAnalyzing }) {
     const inputRef = useRef()
     const [dragging, setDragging] = useState(false)
 
@@ -23,6 +23,7 @@ export default function UploadZone({ label, accept, icon, onFileSelect, preview,
             onDragLeave={() => setDragging(false)}
             onDrop={onDrop}
         >
+            {isAnalyzing && preview && <div className="scan-line" />}
             <input ref={inputRef} type="file" accept={accept}
                 onChange={(e) => handleFile(e.target.files[0])} />
 
