@@ -1,9 +1,10 @@
 import { useRef, useEffect, useState } from 'react'
 
-export default function LiveTracker({ photo }) {
+export default function LiveTracker({ photo, onPhotoCapture }) {
     const videoRef = useRef(null)
     const canvasRef = useRef(null)
     const [isTracking, setIsTracking] = useState(false)
+    const [webcamActive, setWebcamActive] = useState(false)
     const [error, setError] = useState(null)
     const [status, setStatus] = useState('Ready')
 
@@ -39,19 +40,40 @@ export default function LiveTracker({ photo }) {
                 }
             } catch (err) {
                 setError("Webcam access denied. Make sure you're on HTTPS or localhost.")
+                setWebcamActive(false)
             }
         }
 
-        if (isTracking) {
+        if (isTracking || webcamActive) {
             startWebcam()
-            interval = setInterval(captureAndTrack, 250) // 4 fps for tracking
+            if (isTracking) {
+                interval = setInterval(captureAndTrack, 250) // 4 fps for tracking
+            }
         }
 
         return () => {
             if (stream) stream.getTracks().forEach(t => t.stop())
             if (interval) clearInterval(interval)
         }
-    }, [isTracking])
+    }, [isTracking, webcamActive])
+
+    const capturePhoto = () => {
+        if (!videoRef.current) return
+        const video = videoRef.current
+        const canvas = document.createElement('canvas')
+        canvas.width = 640
+        canvas.height = 480
+        const ctx = canvas.getContext('2d')
+        ctx.drawImage(video, 0, 0, 640, 480)
+
+        canvas.toBlob((blob) => {
+            if (blob && onPhotoCapture) {
+                const file = new File([blob], "captured_suspect.jpg", { type: "image/jpeg" })
+                onPhotoCapture(file)
+                setWebcamActive(false)
+            }
+        }, 'image/jpeg', 0.95)
+    }
 
     const captureAndTrack = async () => {
         if (!videoRef.current || !canvasRef.current) return
@@ -60,7 +82,7 @@ export default function LiveTracker({ photo }) {
         const canvas = canvasRef.current
         const ctx = canvas.getContext('2d')
 
-        // Capture frame to a temporary small canvas or use the main one
+        // Capture frame to a temporary small canvas
         const tempCanvas = document.createElement('canvas')
         tempCanvas.width = 640
         tempCanvas.height = 480
@@ -110,13 +132,29 @@ export default function LiveTracker({ photo }) {
     return (
         <div className="live-tracker">
             <div className="live-controls">
+                {!isTracking && !webcamActive && (
+                    <button className="btn-analyze btn-webcam" onClick={() => setWebcamActive(true)}>
+                        📷 Open Webcam
+                    </button>
+                )}
+
+                {webcamActive && !isTracking && (
+                    <button className="btn-analyze btn-capture" onClick={capturePhoto}>
+                        📸 Take Reference Photo
+                    </button>
+                )}
+
                 <button
                     className={`btn-analyze ${isTracking ? 'btn-stop' : ''}`}
                     disabled={!photo}
-                    onClick={() => setIsTracking(!isTracking)}
+                    onClick={() => {
+                        setIsTracking(!isTracking)
+                        setWebcamActive(false)
+                    }}
                 >
                     {isTracking ? '🛑 Stop Live Tracking' : '📹 Start Live Tracking'}
                 </button>
+
                 <div className={`live-status-badge ${isTracking ? 'active' : ''}`}>
                     <span className="dot" /> {status}
                 </div>
@@ -128,10 +166,10 @@ export default function LiveTracker({ photo }) {
                 <video ref={videoRef} autoPlay playsInline muted className="live-video" />
                 <canvas ref={canvasRef} width={640} height={480} className="live-canvas" />
 
-                {!isTracking && (
+                {!isTracking && !webcamActive && (
                     <div className="video-overlay">
                         <div className="camera-icon">📷</div>
-                        <p>Camera is off. Upload a suspect photo and click Start.</p>
+                        <p>Webcam is inactive. Use "Open Webcam" to capture a photo or upload a suspect photo & click Start.</p>
                     </div>
                 )}
             </div>

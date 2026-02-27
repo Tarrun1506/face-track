@@ -267,7 +267,7 @@ export default function App() {
               </ul>
             </div>
           </div>
-          <LiveTracker photo={photo} />
+          <LiveTracker photo={photo} onPhotoCapture={handlePhotoSelect} />
         </div>
       )}
 
