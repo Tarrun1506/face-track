@@ -121,7 +121,7 @@ def analyze_video():
 
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
-        # ── Get video metadata reliably via OpenCV ────────────────────────────
+        # ── Get video metadata via OpenCV ─────────────────────────────────
         _cap = cv2.VideoCapture(video_path)
         if not _cap.isOpened():
             return jsonify({'error': 'Cannot open video file'}), 400
@@ -137,23 +137,21 @@ def analyze_video():
         OH = int(H * scale_out) & ~1
         print(f'[INFO] Input: {W}x{H}@{fps:.0f}fps → Output: {OW}x{OH}')
 
-        # ── GPU-decode input with NVDEC (fallback to CPU) ─────────────────────
+        # ── GPU-decode input ───────────────────────────────────────────────
         decode_cmd = [ffmpeg_exe]
         if HAS_NVENC:
-            # hwaccel cuda for fast decode — no hwaccel_output_format so scale filter works
             decode_cmd += ['-hwaccel', 'cuda']
         decode_cmd += [
             '-i', video_path,
             '-vf', f'scale={OW}:{OH}',
-            '-f', 'rawvideo', '-pix_fmt', 'bgr24',
-            'pipe:1'
+            '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1'
         ]
         reader = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, bufsize=10**8)
 
-        # ── GPU-encode output with NVENC (fallback to libx264) ────────────────
-        encoder = 'h264_nvenc' if HAS_NVENC else 'libx264'
-        enc_preset = 'p1' if HAS_NVENC else 'ultrafast'
+        # ── GPU-encode output ──────────────────────────────────────────────
+        encoder    = 'h264_nvenc' if HAS_NVENC else 'libx264'
+        enc_preset = 'p1'        if HAS_NVENC else 'ultrafast'
         writer_proc = subprocess.Popen([
             ffmpeg_exe, '-y',
             '-f', 'rawvideo', '-vcodec', 'rawvideo',
@@ -165,57 +163,132 @@ def analyze_video():
         ], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         print(f'[INFO] Encoder: {encoder}  Decoder: {"NVDEC" if HAS_NVENC else "CPU"}')
 
-        SKIP       = 8
-        CARRY      = 1   # drop box immediately when face not detected
+        # ── Detect-Then-Track constants ────────────────────────────────────
+        SCAN_SKIP    = 8   # run InsightFace every N frames while scanning
+        VERIFY_EVERY = 30  # re-verify identity while tracking (frames)
+        MIN_TRACK_CONF = 0.6  # tracker update confidence threshold
+
+        # ── State machine ──────────────────────────────────────────────────
+        MODE_SCAN  = 'scan'
+        MODE_TRACK = 'track'
+        mode       = MODE_SCAN
+        tracker    = None
+        last_box   = None   # [x1,y1,x2,y2] in image coords
+        last_conf  = 0.0
+        frames_since_verify = 0
+
         frame_size = OW * OH * 3
         detections = []
         thumbnails = []
         timeline   = []
-        carry_left = 0
-        last_box   = None
-        last_conf  = 0.0
         first_det  = True
         frame_idx  = 0
+
+        def init_tracker(frame, box):
+            """Create a CSRT tracker initialised on box=[x1,y1,x2,y2]."""
+            x1, y1, x2, y2 = [int(v) for v in box]
+            trk = cv2.TrackerCSRT_create()
+            trk.init(frame, (x1, y1, x2 - x1, y2 - y1))
+            return trk
+
+        def crop_to_box(frame, box):
+            x1, y1, x2, y2 = max(0,int(box[0])), max(0,int(box[1])), \
+                              min(OW,int(box[2])), min(OH,int(box[3]))
+            return frame[y1:y2, x1:x2]
 
         while True:
             raw = reader.stdout.read(frame_size)
             if len(raw) < frame_size:
                 break
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape((OH, OW, 3)).copy()
-            ts    = round(frame_idx / fps, 2)
+            frame    = np.frombuffer(raw, dtype=np.uint8).reshape((OH, OW, 3)).copy()
+            ts       = round(frame_idx / fps, 2)
             detected = False
 
-            if frame_idx % SKIP == 0:
-                t0 = time.time()
-                box, conf = match_frame(frame, ref_emb)
-                print(f'[FRAME {frame_idx}] {(time.time()-t0)*1000:.0f}ms | match={box is not None}')
-                if box is not None:
-                    detected   = True
-                    last_box   = box
-                    last_conf  = conf
-                    carry_left = CARRY
+            if mode == MODE_SCAN:
+                # ── SCAN: run face recognition on every SCAN_SKIP-th frame ──
+                if frame_idx % SCAN_SKIP == 0:
+                    t0 = time.time()
+                    box, conf = match_frame(frame, ref_emb)
+                    elapsed = (time.time() - t0) * 1000
+                    print(f'[SCAN  #{frame_idx}] {elapsed:.0f}ms | found={box is not None}')
+
+                    if box is not None:
+                        last_box  = box
+                        last_conf = conf
+                        detected  = True
+                        # Switch to TRACK mode
+                        mode    = MODE_TRACK
+                        tracker = init_tracker(frame, box)
+                        frames_since_verify = 0
+                        print(f'[INFO] Target ACQUIRED at frame {frame_idx} — switching to TRACK mode')
+
+                        detections.append({'frame': frame_idx, 'timestamp': ts,
+                                           'confidence': round(conf, 1)})
+                        if len(thumbnails) < 8:
+                            crop = crop_to_box(frame, box)
+                            if crop.size > 0:
+                                thumb = cv2.resize(crop, (120, 120))
+                                _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                                thumbnails.append({'data': base64.b64encode(buf).decode(),
+                                                   'timestamp': ts, 'confidence': round(conf, 1)})
+
+            else:  # MODE_TRACK
+                # ── TRACK: update OpenCV tracker ──────────────────────────
+                ok, rect = tracker.update(frame)
+                frames_since_verify += 1
+
+                if ok:
+                    x, y, w, h = [int(v) for v in rect]
+                    tracked_box = [x, y, x + w, y + h]
+
+                    # Periodic identity re-verification
+                    if frames_since_verify >= VERIFY_EVERY:
+                        frames_since_verify = 0
+                        crop = crop_to_box(frame, tracked_box)
+                        if crop.size > 0:
+                            embs = face_app.get(crop)
+                            verified = False
+                            if embs:
+                                emb = embs[0].embedding
+                                emb = emb / np.linalg.norm(emb)
+                                sim = float(np.dot(ref_emb, emb))
+                                if sim > THRESH:
+                                    verified = True
+                                    last_conf = sim_to_conf(sim)
+                            if not verified:
+                                print(f'[INFO] Re-verify FAILED at frame {frame_idx} — reverting to SCAN mode')
+                                mode    = MODE_SCAN
+                                tracker = None
+                                last_box = None
+                                timeline.append({'frame': frame_idx, 'timestamp': ts, 'detected': False})
+                                frame_idx += 1
+                                writer_proc.stdin.write(frame.tobytes())
+                                continue
+
+                    last_box = tracked_box
+                    detected = True
+                    t0 = time.time()
+                    print(f'[TRACK #{frame_idx}] {(time.time()-t0)*1000:.0f}ms | box={tracked_box}')
                     detections.append({'frame': frame_idx, 'timestamp': ts,
-                                       'confidence': round(conf, 1)})
+                                       'confidence': round(last_conf, 1)})
                     if len(thumbnails) < 8:
-                        x1,y1 = max(0,int(box[0])), max(0,int(box[1]))
-                        x2,y2 = min(OW,int(box[2])), min(OH,int(box[3]))
-                        crop  = frame[y1:y2, x1:x2]
+                        crop = crop_to_box(frame, tracked_box)
                         if crop.size > 0:
                             thumb = cv2.resize(crop, (120, 120))
                             _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
                             thumbnails.append({'data': base64.b64encode(buf).decode(),
-                                               'timestamp': ts, 'confidence': round(conf, 1)})
+                                               'timestamp': ts, 'confidence': round(last_conf, 1)})
                 else:
-                    if carry_left > 0:
-                        carry_left -= 1
-                        detected = last_box is not None
-                    else:
-                        last_box = None
+                    # Tracker lost the target — fall back to scan
+                    print(f'[INFO] Tracker LOST at frame {frame_idx} — reverting to SCAN mode')
+                    mode    = MODE_SCAN
+                    tracker = None
+                    last_box = None
 
-                timeline.append({'frame': frame_idx, 'timestamp': ts,
-                                 'detected': detected or (carry_left > 0 and last_box is not None)})
+            timeline.append({'frame': frame_idx, 'timestamp': ts, 'detected': detected})
 
-            if last_box is not None:
+            # Draw bounding box if we have one
+            if last_box is not None and detected:
                 if first_det and detections:
                     first_det   = False
                     red_overlay = np.full_like(frame, (0, 0, 180))
@@ -238,7 +311,7 @@ def analyze_video():
             'match_found': n > 0,
             'stats': {
                 'total_frames':     frame_idx,
-                'frames_analyzed':  frame_idx // SKIP,
+                'frames_analyzed':  sum(1 for t in timeline if t['detected'] or frame_idx % SCAN_SKIP == 0),
                 'total_detections': n,
                 'avg_confidence':   avg_conf,
                 'first_seen':       detections[0]['timestamp'] if n else None,
