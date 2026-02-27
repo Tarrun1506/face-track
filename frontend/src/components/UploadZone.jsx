@@ -17,39 +17,43 @@ export default function UploadZone({ label, accept, icon, onFileSelect, preview,
 
     return (
         <div
-            className={`upload-zone ${dragging ? 'drag-over' : ''} ${preview ? 'has-file' : ''}`}
+            className={`upload-zone glass-panel ${dragging ? 'drag-over' : ''} ${preview ? 'has-file' : ''}`}
             onClick={() => inputRef.current?.click()}
             onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
             onDragLeave={() => setDragging(false)}
             onDrop={onDrop}
         >
-            {isAnalyzing && preview && <div className="scan-line" />}
             <input ref={inputRef} type="file" accept={accept}
                 onChange={(e) => handleFile(e.target.files[0])} />
 
             <div className="zone-label">
-                {icon} {label}
-                <span className="badge">{accept.includes('image') ? 'JPG / PNG' : 'MP4 / MOV / AVI'}</span>
+                <span>{icon} {label}</span>
+                <span className="badge">{accept.includes('image') ? 'JPG / PNG' : 'MP4 / MOV'}</span>
             </div>
 
             {!preview ? (
                 <div className="zone-placeholder">
-                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-                        <path strokeLinecap="round" strokeLinejoin="round"
-                            d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-                    </svg>
-                    <p>Drag & drop or click to upload</p>
+                    <div className="upload-icon-circle" style={{ marginBottom: '10px' }}>
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="17 8 12 3 7 8" /><line x1="12" y1="3" x2="12" y2="15" />
+                        </svg>
+                    </div>
+                    <p>Tap to upload or drop file here</p>
                 </div>
             ) : accept.includes('image') ? (
-                <>
+                <div className="preview-wrap">
                     <img className="photo-preview" src={preview} alt="preview" />
-                    <p className="file-name">✓ {fileName}</p>
-                </>
+                    <div className="file-name" style={{ marginTop: '12px', textAlign: 'center' }}>
+                        <span className="check">✓</span> {fileName}
+                    </div>
+                </div>
             ) : (
-                <>
-                    <video className="video-preview" src={preview} controls />
-                    <p className="file-name">✓ {fileName}</p>
-                </>
+                <div className="preview-wrap">
+                    <video className="video-preview" src={preview} />
+                    <div className="file-name" style={{ marginTop: '12px', textAlign: 'center' }}>
+                        <span className="check">✓</span> {fileName}
+                    </div>
+                </div>
             )}
         </div>
     )

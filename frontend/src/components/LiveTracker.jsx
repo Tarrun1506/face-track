@@ -6,7 +6,7 @@ export default function LiveTracker({ photo, onPhotoCapture }) {
     const [isTracking, setIsTracking] = useState(false)
     const [webcamActive, setWebcamActive] = useState(false)
     const [error, setError] = useState(null)
-    const [status, setStatus] = useState('Ready')
+    const [status, setStatus] = useState('System Idle')
 
     // Prepare backend when photo changes
     useEffect(() => {
@@ -20,7 +20,7 @@ export default function LiveTracker({ photo, onPhotoCapture }) {
                     const data = await res.json()
                     throw new Error(data.error || 'Failed to prepare reference')
                 }
-                setStatus('Reference Ready')
+                setStatus('Target Locked')
             } catch (err) {
                 setError(err.message)
             }
@@ -106,23 +106,39 @@ export default function LiveTracker({ photo, onPhotoCapture }) {
                 const [x1, y1, x2, y2] = data.box
                 const conf = data.confidence
 
-                // Draw bounding box
-                ctx.strokeStyle = '#22ff88'
-                ctx.lineWidth = 3
+                // Modern Rect
+                ctx.strokeStyle = '#10b981'
+                ctx.lineWidth = 2
+                ctx.setLineDash([10, 5])
                 ctx.strokeRect(x1, y1, x2 - x1, y2 - y1)
+                ctx.setLineDash([])
 
-                // Draw label
-                ctx.fillStyle = '#22ff88'
-                ctx.font = 'bold 14px JetBrains Mono, monospace'
-                const label = `SUSPECT MATCHed: ${conf.toFixed(1)}%`
-                const textWidth = ctx.measureText(label).width
-                ctx.fillRect(x1, y1 - 25, textWidth + 10, 25)
+                // Corners
+                const len = 20
+                ctx.lineWidth = 4
+                ctx.beginPath()
+                // Top Left
+                ctx.moveTo(x1, y1 + len); ctx.lineTo(x1, y1); ctx.lineTo(x1 + len, y1)
+                // Top Right
+                ctx.moveTo(x2 - len, y1); ctx.lineTo(x2, y1); ctx.lineTo(x2, y1 + len)
+                // Bottom Left
+                ctx.moveTo(x1, y2 - len); ctx.lineTo(x1, y2); ctx.lineTo(x1 + len, y2)
+                // Bottom Right
+                ctx.moveTo(x2 - len, y2); ctx.lineTo(x2, y2); ctx.lineTo(x2, y2 - len)
+                ctx.stroke()
+
+                // Tag
+                ctx.fillStyle = '#10b981'
+                const label = `MATCH: ${conf.toFixed(1)}%`
+                ctx.font = '700 12px JetBrains Mono'
+                const tw = ctx.measureText(label).width
+                ctx.fillRect(x1, y1 - 24, tw + 20, 24)
                 ctx.fillStyle = '#000'
-                ctx.fillText(label, x1 + 5, y1 - 7)
+                ctx.fillText(label, x1 + 10, y1 - 8)
 
-                setStatus(`In Frame (${conf.toFixed(0)}%)`)
+                setStatus(`TRACKING... (${conf.toFixed(0)}%)`)
             } else {
-                setStatus('Scanning...')
+                setStatus('SCANNING...')
             }
         } catch (err) {
             console.error(err)
@@ -131,45 +147,47 @@ export default function LiveTracker({ photo, onPhotoCapture }) {
 
     return (
         <div className="live-tracker">
-            <div className="live-controls">
+            <div className="live-controls" style={{ display: 'flex', gap: '12px', marginBottom: '24px', alignItems: 'center' }}>
                 {!isTracking && !webcamActive && (
-                    <button className="btn-analyze btn-webcam" onClick={() => setWebcamActive(true)}>
-                        📷 Open Webcam
+                    <button className="btn-analyze btn-webcam" onClick={() => setWebcamActive(true)} style={{ background: 'var(--accent)', boxShadow: '0 10px 20px var(--accent-glow)' }}>
+                        📷 Initialize Webcam
                     </button>
                 )}
 
                 {webcamActive && !isTracking && (
-                    <button className="btn-analyze btn-capture" onClick={capturePhoto}>
-                        📸 Take Reference Photo
+                    <button className="btn-analyze btn-capture" onClick={capturePhoto} style={{ background: 'var(--accent)', boxShadow: '0 10px 20px var(--accent-glow)' }}>
+                        📸 Capture Target
                     </button>
                 )}
 
                 <button
-                    className={`btn-analyze ${isTracking ? 'btn-stop' : ''}`}
+                    className={`btn-analyze ${isTracking ? 'btn-danger' : ''}`}
                     disabled={!photo}
                     onClick={() => {
                         setIsTracking(!isTracking)
                         setWebcamActive(false)
                     }}
+                    style={isTracking ? { background: 'var(--danger)', boxShadow: '0 10px 20px var(--danger-dim)' } : {}}
                 >
-                    {isTracking ? '🛑 Stop Live Tracking' : '📹 Start Live Tracking'}
+                    {isTracking ? '🛑 Terminate Batch' : '📹 Execute Live Scan'}
                 </button>
 
-                <div className={`live-status-badge ${isTracking ? 'active' : ''}`}>
-                    <span className="dot" /> {status}
+                <div className={`gpu-badge ${isTracking ? 'active' : ''}`} style={{ marginLeft: 'auto', background: isTracking ? 'var(--primary-dim)' : 'rgba(255,255,255,0.05)', borderColor: isTracking ? 'var(--primary)' : 'var(--border)' }}>
+                    <div className="dot" style={{ background: isTracking ? 'var(--primary)' : 'var(--text-dim)' }} />
+                    {status}
                 </div>
             </div>
 
-            {error && <div className="error-box">⚠️ {error}</div>}
+            {error && <div className="error-box glass-panel">⚠️ {error}</div>}
 
-            <div className="video-container">
-                <video ref={videoRef} autoPlay playsInline muted className="live-video" />
-                <canvas ref={canvasRef} width={640} height={480} className="live-canvas" />
+            <div className="video-container" style={{ position: 'relative', borderRadius: '20px', overflow: 'hidden', border: '1px solid var(--border-bright)', boxShadow: 'var(--shadow-lg)' }}>
+                <video ref={videoRef} autoPlay playsInline muted className="live-video" style={{ width: '100%', display: 'block' }} />
+                <canvas ref={canvasRef} width={640} height={480} className="live-canvas" style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }} />
 
                 {!isTracking && !webcamActive && (
-                    <div className="video-overlay">
-                        <div className="camera-icon">📷</div>
-                        <p>Webcam is inactive. Use "Open Webcam" to capture a photo or upload a suspect photo & click Start.</p>
+                    <div className="video-overlay" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)', color: 'var(--text-muted)' }}>
+                        <div className="camera-icon" style={{ fontSize: '48px', marginBottom: '16px', opacity: 0.5 }}>📷</div>
+                        <p style={{ fontFamily: 'var(--mono)', fontSize: '0.9rem' }}>Optical Sensor Offline</p>
                     </div>
                 )}
             </div>

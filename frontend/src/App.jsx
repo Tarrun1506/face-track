@@ -107,7 +107,7 @@ export default function App() {
       <Header gpuName={gpuName} />
 
       {/* ── Tab Switcher ───────────────────────────── */}
-      <div className="tab-switcher">
+      <div className="tab-switcher" style={{ marginBottom: '40px' }}>
         <button
           className={`tab-btn ${tab === 'video' ? 'active' : ''}`}
           onClick={() => setTab('video')}
@@ -118,16 +118,16 @@ export default function App() {
           className={`tab-btn ${tab === 'live' ? 'active' : ''}`}
           onClick={() => setTab('live')}
         >
-          📷 Live Webcam Tracking
+          📷 Live Tracking
         </button>
       </div>
 
       {tab === 'video' ? (
-        <>
+        <div className="video-mode-wrap" style={{ animation: 'fadeIn 0.5s ease' }}>
           {/* ── Upload ─────────────────────────────────── */}
           <div className="upload-grid">
             <UploadZone
-              label="Suspect Photo"
+              label="Suspect Reference"
               icon="🧑"
               accept="image/*"
               onFileSelect={handlePhotoSelect}
@@ -136,7 +136,7 @@ export default function App() {
               isAnalyzing={isAnalyzing}
             />
             <UploadZone
-              label="CCTV / Video"
+              label="Surveillance Footage"
               icon="📹"
               accept="video/*"
               onFileSelect={handleVideoSelect}
@@ -155,25 +155,24 @@ export default function App() {
             >
               {isAnalyzing ? (
                 <>
-                  <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite' }}>⟳</span>
-                  Scanning…
+                  <span style={{ display: 'inline-block', animation: 'spin 1s linear infinite', marginRight: '8px' }}>⟳</span>
+                  Analyzing...
                 </>
               ) : (
-                <>🔍 Scan Video</>
+                <>🔍 Execute Analysis</>
               )}
             </button>
 
-            {/* ④ Reset button — only visible after a result */}
             {results && (
               <button className="btn-reset" onClick={handleReset}>
-                ↺ Scan Another
+                ↺ Reset Dashboard
               </button>
             )}
           </div>
 
           {/* ── Progress ───────────────────────────────── */}
           {isAnalyzing && (
-            <div className="progress-wrap">
+            <div className="progress-wrap glass-panel" style={{ marginBottom: '40px' }}>
               <div className="progress-bar-outer">
                 <div className="progress-bar-inner" />
               </div>
@@ -183,74 +182,72 @@ export default function App() {
 
           {/* ── Error ──────────────────────────────────── */}
           {error && (
-            <div className="error-box">
+            <div className="error-box glass-panel">
               ⚠️ {error}
             </div>
           )}
 
           {/* ── Results ────────────────────────────────── */}
           {results && (
-            <>
-              {/* ① Processing Timer */}
+            <div className="results-container" style={{ animation: 'fadeIn 0.5s ease' }}>
               {processTime && (
                 <div className="timer-badge">
-                  ⚡ Processed in <strong>{processTime}s</strong> on {gpuShort}
+                  ⚡ Computational Latency: <strong>{processTime}s</strong> on {gpuShort}
                 </div>
               )}
 
-              {/* Alert Banner */}
               <div className={`alert-banner ${match_found ? 'match' : 'no-match'}`}>
                 <span className="banner-icon">{match_found ? '🚨' : '❌'}</span>
                 <div>
                   <div className={`banner-title ${match_found ? 'green' : 'red'}`}>
-                    {match_found ? 'SUSPECT LOCATED' : 'SUSPECT NOT FOUND'}
+                    {match_found ? 'TARGET IDENTIFIED' : 'NO TARGET MATCH'}
                   </div>
                   <div className="banner-sub">
                     {match_found
-                      ? `Identified in ${stats.total_detections} frames · Avg confidence ${stats.avg_confidence}% · GPU: ${stats.gpu}`
-                      : `Scanned ${stats.frames_analyzed} frames across ${stats.video_duration}s of footage`}
+                      ? `Positive ID in ${stats.total_detections} frames · Confidence ${stats.avg_confidence}% · ${stats.gpu}`
+                      : `Scanned ${stats.frames_analyzed} frames · ${stats.video_duration}s duration`}
                   </div>
                 </div>
               </div>
 
-              {/* ⑤ No-match tips */}
               {!match_found && (
-                <div className="no-match-tips">
-                  <div className="tips-title">💡 Tips to improve detection</div>
+                <div className="no-match-tips glass-panel">
+                  <div className="tips-title">💡 Analysis Recommendations</div>
                   <ul>
-                    <li>Use a clear, well-lit <strong>frontal face photo</strong> of the suspect</li>
-                    <li>Make sure the suspect <strong>actually appears</strong> in the video clip</li>
-                    <li>Try a <strong>shorter clip</strong> focused on the relevant segment</li>
-                    <li>Avoid heavily compressed or blurry reference photos</li>
+                    <li>Use a high-resolution <strong>frontal reference</strong></li>
+                    <li>Ensure target face is <strong>visible</strong> in footage</li>
+                    <li>Adjust <strong>lighting conditions</strong> for reference capture</li>
                   </ul>
                 </div>
               )}
 
-              {/* Stats Cards */}
               <div className="stats-grid">
-                <StatCard label="Detections" value={stats.total_detections} unit="frames matched" delay={0} />
-                <StatCard label="First Seen" value={fmt(stats.first_seen)} unit="timestamp" delay={0.07} />
-                <StatCard label="Last Seen" value={fmt(stats.last_seen)} unit="timestamp" delay={0.14} />
-                <StatCard label="Avg Confidence" value={stats.avg_confidence ? `${stats.avg_confidence}%` : '—'} unit="match score" delay={0.21} />
-                <StatCard label="Duration" value={`${stats.video_duration}s`} unit="video length" delay={0.28} />
+                <StatCard label="Matches" value={stats.total_detections} unit="frames" delay={0} />
+                <StatCard label="Entry" value={fmt(stats.first_seen)} unit="sec" delay={0.07} />
+                <StatCard label="Exit" value={fmt(stats.last_seen)} unit="sec" delay={0.14} />
+                <StatCard label="Max Conf" value={stats.avg_confidence ? `${stats.avg_confidence}%` : '—'} unit="score" delay={0.21} />
+                <StatCard label="Clip Len" value={`${stats.video_duration}s`} unit="total" delay={0.28} />
               </div>
 
-              {/* Timeline */}
-              <TimelineBar timeline={timeline} duration={stats.video_duration} />
+              <div className="glass-panel" style={{ padding: '24px', marginBottom: '32px' }}>
+                <TimelineBar timeline={timeline} duration={stats.video_duration} />
+              </div>
 
-              {/* Thumbnails */}
-              <ThumbnailGallery thumbnails={thumbnails} />
+              <div className="glass-panel" style={{ padding: '24px', marginBottom: '32px' }}>
+                <ThumbnailGallery thumbnails={thumbnails} />
+              </div>
 
-              {/* Video Player */}
-              <VideoPlayer videoUrl={video_url} />
-            </>
+              <div className="glass-panel" style={{ overflow: 'hidden' }}>
+                <VideoPlayer videoUrl={video_url} />
+              </div>
+            </div>
           )}
-        </>
+        </div>
       ) : (
-        <div className="live-mode-wrap">
+        <div className="live-mode-wrap" style={{ animation: 'fadeIn 0.5s ease' }}>
           <div className="live-upload-row">
             <UploadZone
-              label="Suspect Photo"
+              label="Suspect Target"
               icon="🧑"
               accept="image/*"
               onFileSelect={handlePhotoSelect}
@@ -258,21 +255,25 @@ export default function App() {
               fileName={photo?.name}
               isAnalyzing={false}
             />
-            <div className="live-instructions">
-              <h3>Live Tracker Instructions</h3>
+            <div className="live-instructions glass-panel">
+              <h3>Live Surveillance Protocol</h3>
               <ul>
-                <li>1. Upload a <strong>frontal photo</strong> of the target person.</li>
-                <li>2. Connect your webcam and click <strong>Start Tracking</strong>.</li>
-                <li>3. The system will look for this person in the live stream.</li>
+                <li><span>1.</span><span>Establish a <strong>clear reference</strong> capture.</span></li>
+                <li><span>2.</span><span>Initialize the <strong>optical sensor</strong> stream.</span></li>
+                <li><span>3.</span><span>Execute <strong>real-time matching</strong> algorithm.</span></li>
               </ul>
             </div>
           </div>
-          <LiveTracker photo={photo} onPhotoCapture={handlePhotoSelect} />
+          <div className="glass-panel" style={{ padding: '32px' }}>
+            <LiveTracker photo={photo} onPhotoCapture={handlePhotoSelect} />
+          </div>
         </div>
       )}
 
       <style>{`
         @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .green { color: var(--primary); }
+        .red { color: var(--danger); }
       `}</style>
     </div>
   )
