@@ -163,19 +163,32 @@ def analyze_video():
         ], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
         print(f'[INFO] Encoder: {encoder}  Decoder: {"NVDEC" if HAS_NVENC else "CPU"}')
 
-        # ── Detect-Then-Track constants ────────────────────────────────────
-        SCAN_SKIP    = 6    # run InsightFace on full frame every N frames while scanning
-        ROI_SKIP     = 2    # run InsightFace on ROI crop every N frames while tracking
-        ROI_PAD      = 1.5  # multiply box dims by this to get the search region
-        MISS_LIMIT   = 15   # frames without ROI hit before falling back to full scan
+        # ── LK Optical Flow params (standard cv2, no contrib needed) ──────
+        LK_PARAMS = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)
+        )
+        FEATURE_PARAMS = dict(
+            maxCorners=120,
+            qualityLevel=0.01,
+            minDistance=5,
+            blockSize=7
+        )
+        SCAN_SKIP    = 6    # full-frame face scan every N frames while searching
+        RE_INIT_EVERY = 45  # refresh keypoints every N tracked frames (prevents drift)
+        MIN_POINTS   = 6    # min good keypoints before we consider tracking lost
+        BODY_EXPAND  = 2.8  # expand box downward by this factor to include torso
 
-        # ── State machine ──────────────────────────────────────────────────
+        # ── State ──────────────────────────────────────────────────────────
         MODE_SCAN  = 'scan'
         MODE_TRACK = 'track'
         mode       = MODE_SCAN
-        last_box   = None   # [x1,y1,x2,y2] in full-frame coords
+        last_box   = None   # [x1, y1, x2, y2] current tracked person box
         last_conf  = 0.0
-        miss_count = 0      # consecutive frames where ROI search found nothing
+        prev_gray  = None   # previous frame (grayscale) for optical flow
+        track_pts  = None   # (N,1,2) float32 keypoints being tracked
+        frames_tracked = 0  # frames since last keypoint re-init
 
         frame_size = OW * OH * 3
         detections = []
@@ -184,21 +197,46 @@ def analyze_video():
         first_det  = True
         frame_idx  = 0
 
-        def padded_roi(box, pad, W, H):
-            """Return (rx1,ry1,rx2,ry2) — a padded search region clamped to frame."""
-            x1, y1, x2, y2 = box
-            cx, cy = (x1+x2)/2, (y1+y2)/2
-            hw = (x2-x1)*pad/2
-            hh = (y2-y1)*pad/2
-            return (max(0, int(cx-hw)), max(0, int(cy-hh)),
-                    min(W, int(cx+hw)), min(H, int(cy+hh)))
+        def body_box(face_box, H):
+            """Expand a face bounding box downward to capture the torso too."""
+            x1, y1, x2, y2 = [int(v) for v in face_box]
+            fh = y2 - y1
+            body_y2 = min(H, y2 + int(fh * BODY_EXPAND))
+            # Also pad sides a little
+            pad_x = int((x2 - x1) * 0.3)
+            return (max(0, x1 - pad_x), y1, min(OW, x2 + pad_x), body_y2)
+
+        def init_keypoints(gray, box):
+            """Sample strong corner features inside the body box."""
+            bx1, by1, bx2, by2 = box
+            mask = np.zeros_like(gray)
+            mask[by1:by2, bx1:bx2] = 255
+            pts = cv2.goodFeaturesToTrack(gray, mask=mask, **FEATURE_PARAMS)
+            return pts  # (N,1,2) or None
+
+        def box_from_points(pts, prev_box):
+            """Estimate new bounding box from tracked point cloud."""
+            if pts is None or len(pts) < MIN_POINTS:
+                return None
+            xs = pts[:, 0, 0]
+            ys = pts[:, 0, 1]
+            # Robust: use percentile to avoid outlier points
+            x1 = int(np.percentile(xs, 5))
+            y1 = int(np.percentile(ys, 5))
+            x2 = int(np.percentile(xs, 95))
+            y2 = int(np.percentile(ys, 95))
+            # Enforce minimum box size
+            pw, ph = x2 - x1, y2 - y1
+            if pw < 20 or ph < 20:
+                return prev_box
+            return [x1, y1, x2, y2]
 
         def save_thumbnail(frame, box):
             x1,y1,x2,y2 = max(0,int(box[0])),max(0,int(box[1])),min(OW,int(box[2])),min(OH,int(box[3]))
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 return None
-            thumb = cv2.resize(crop, (120,120))
+            thumb = cv2.resize(crop, (120, 120))
             _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
             return base64.b64encode(buf).decode()
 
@@ -207,6 +245,7 @@ def analyze_video():
             if len(raw) < frame_size:
                 break
             frame    = np.frombuffer(raw, dtype=np.uint8).reshape((OH, OW, 3)).copy()
+            gray     = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             ts       = round(frame_idx / fps, 2)
             detected = False
 
@@ -218,38 +257,21 @@ def analyze_video():
                     print(f'[SCAN  #{frame_idx}] {(time.time()-t0)*1000:.0f}ms | found={box is not None}')
 
                     if box is not None:
-                        last_box   = box.tolist() if hasattr(box, 'tolist') else list(box)
-                        last_conf  = conf
-                        detected   = True
-                        miss_count = 0
-                        mode       = MODE_TRACK
-                        print(f'[INFO] Target ACQUIRED @frame {frame_idx} — entering ROI-TRACK mode')
-
-                        detections.append({'frame': frame_idx, 'timestamp': ts,
-                                           'confidence': round(conf, 1)})
-                        if len(thumbnails) < 8:
-                            d = save_thumbnail(frame, last_box)
-                            if d:
-                                thumbnails.append({'data': d, 'timestamp': ts,
-                                                   'confidence': round(conf, 1)})
-
-            # ── PHASE 2: TRACK — ROI-crop face recognition ─────────────────
-            else:
-                if frame_idx % ROI_SKIP == 0:
-                    rx1, ry1, rx2, ry2 = padded_roi(last_box, ROI_PAD, OW, OH)
-                    roi = frame[ry1:ry2, rx1:rx2]
-
-                    box_in_roi, conf = match_frame(roi, ref_emb)
-                    print(f'[TRACK #{frame_idx}] ROI={rx1},{ry1}-{rx2},{ry2} | found={box_in_roi is not None}')
-
-                    if box_in_roi is not None:
-                        # Translate box from ROI coords → full-frame coords
-                        bx1,by1,bx2,by2 = box_in_roi
-                        full_box = [rx1+bx1, ry1+by1, rx1+bx2, ry1+by2]
-                        last_box  = full_box
                         last_conf = conf
                         detected  = True
-                        miss_count = 0
+                        # Expand to body region for robust tracking
+                        bbox = body_box(box, OH)
+                        last_box = list(bbox)
+
+                        # Initialise LK tracker on the body region
+                        track_pts = init_keypoints(gray, bbox)
+                        if track_pts is not None and len(track_pts) >= MIN_POINTS:
+                            mode = MODE_TRACK
+                            frames_tracked = 0
+                            print(f'[INFO] Target ACQUIRED @frame {frame_idx} '
+                                  f'({len(track_pts)} keypoints) — entering BODY-TRACK mode')
+                        else:
+                            print(f'[WARN] Too few keypoints ({track_pts is not None and len(track_pts)}) — staying in SCAN')
 
                         detections.append({'frame': frame_idx, 'timestamp': ts,
                                            'confidence': round(conf, 1)})
@@ -258,22 +280,57 @@ def analyze_video():
                             if d:
                                 thumbnails.append({'data': d, 'timestamp': ts,
                                                    'confidence': round(conf, 1)})
-                    else:
-                        # ROI miss — keep box visible but count miss
-                        miss_count += 1
-                        if miss_count >= MISS_LIMIT:
-                            print(f'[INFO] Target LOST after {miss_count} misses — reverting to SCAN')
-                            mode       = MODE_SCAN
-                            last_box   = None
-                            miss_count = 0
-                        else:
-                            # Still show last known box while searching
-                            detected = True
-                else:
-                    # Non-checked frame: carry previous box if we have one
-                    if last_box is not None:
-                        detected = True
 
+            # ── PHASE 2: TRACK — LK optical flow body tracking ─────────────
+            else:
+                if prev_gray is not None and track_pts is not None:
+                    # Forward LK flow
+                    new_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                        prev_gray, gray, track_pts, None, **LK_PARAMS)
+
+                    # Keep only points where tracking succeeded
+                    if new_pts is not None and status is not None:
+                        good_new = new_pts[status.ravel() == 1]
+                        good_old = track_pts[status.ravel() == 1]
+                    else:
+                        good_new = np.array([])
+                        good_old = np.array([])
+
+                    print(f'[TRACK #{frame_idx}] pts={len(good_new)}')
+
+                    if len(good_new) >= MIN_POINTS:
+                        # Update box from new point cloud
+                        new_box = box_from_points(good_new.reshape(-1, 1, 2), last_box)
+                        if new_box:
+                            last_box = new_box
+                        track_pts = good_new.reshape(-1, 1, 2)
+                        detected  = True
+                        frames_tracked += 1
+
+                        detections.append({'frame': frame_idx, 'timestamp': ts,
+                                           'confidence': round(last_conf, 1)})
+                        if len(thumbnails) < 8:
+                            d = save_thumbnail(frame, last_box)
+                            if d:
+                                thumbnails.append({'data': d, 'timestamp': ts,
+                                                   'confidence': round(last_conf, 1)})
+
+                        # Periodically refresh keypoints to handle drift / occlusion
+                        if frames_tracked % RE_INIT_EVERY == 0:
+                            bbox = (max(0, last_box[0]), max(0, last_box[1]),
+                                    min(OW, last_box[2]), min(OH, last_box[3]))
+                            fresh = init_keypoints(gray, bbox)
+                            if fresh is not None and len(fresh) >= MIN_POINTS:
+                                track_pts = fresh
+                                print(f'[TRACK] Keypoints refreshed ({len(fresh)})')
+                    else:
+                        # Tracking lost — fall back to face scan
+                        print(f'[INFO] Tracking LOST (only {len(good_new)} pts) — reverting to SCAN')
+                        mode      = MODE_SCAN
+                        track_pts = None
+                        last_box  = None
+
+            prev_gray = gray
             timeline.append({'frame': frame_idx, 'timestamp': ts, 'detected': detected})
 
             # Draw bounding box on frame
