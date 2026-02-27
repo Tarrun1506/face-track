@@ -164,18 +164,18 @@ def analyze_video():
         print(f'[INFO] Encoder: {encoder}  Decoder: {"NVDEC" if HAS_NVENC else "CPU"}')
 
         # ── Detect-Then-Track constants ────────────────────────────────────
-        SCAN_SKIP    = 8   # run InsightFace every N frames while scanning
-        VERIFY_EVERY = 30  # re-verify identity while tracking (frames)
-        MIN_TRACK_CONF = 0.6  # tracker update confidence threshold
+        SCAN_SKIP    = 6    # run InsightFace on full frame every N frames while scanning
+        ROI_SKIP     = 2    # run InsightFace on ROI crop every N frames while tracking
+        ROI_PAD      = 1.5  # multiply box dims by this to get the search region
+        MISS_LIMIT   = 15   # frames without ROI hit before falling back to full scan
 
         # ── State machine ──────────────────────────────────────────────────
         MODE_SCAN  = 'scan'
         MODE_TRACK = 'track'
         mode       = MODE_SCAN
-        tracker    = None
-        last_box   = None   # [x1,y1,x2,y2] in image coords
+        last_box   = None   # [x1,y1,x2,y2] in full-frame coords
         last_conf  = 0.0
-        frames_since_verify = 0
+        miss_count = 0      # consecutive frames where ROI search found nothing
 
         frame_size = OW * OH * 3
         detections = []
@@ -184,17 +184,23 @@ def analyze_video():
         first_det  = True
         frame_idx  = 0
 
-        def init_tracker(frame, box):
-            """Create a CSRT tracker initialised on box=[x1,y1,x2,y2]."""
-            x1, y1, x2, y2 = [int(v) for v in box]
-            trk = cv2.TrackerCSRT_create()
-            trk.init(frame, (x1, y1, x2 - x1, y2 - y1))
-            return trk
+        def padded_roi(box, pad, W, H):
+            """Return (rx1,ry1,rx2,ry2) — a padded search region clamped to frame."""
+            x1, y1, x2, y2 = box
+            cx, cy = (x1+x2)/2, (y1+y2)/2
+            hw = (x2-x1)*pad/2
+            hh = (y2-y1)*pad/2
+            return (max(0, int(cx-hw)), max(0, int(cy-hh)),
+                    min(W, int(cx+hw)), min(H, int(cy+hh)))
 
-        def crop_to_box(frame, box):
-            x1, y1, x2, y2 = max(0,int(box[0])), max(0,int(box[1])), \
-                              min(OW,int(box[2])), min(OH,int(box[3]))
-            return frame[y1:y2, x1:x2]
+        def save_thumbnail(frame, box):
+            x1,y1,x2,y2 = max(0,int(box[0])),max(0,int(box[1])),min(OW,int(box[2])),min(OH,int(box[3]))
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+            thumb = cv2.resize(crop, (120,120))
+            _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return base64.b64encode(buf).decode()
 
         while True:
             raw = reader.stdout.read(frame_size)
@@ -204,91 +210,74 @@ def analyze_video():
             ts       = round(frame_idx / fps, 2)
             detected = False
 
+            # ── PHASE 1: SCAN — full-frame face recognition ────────────────
             if mode == MODE_SCAN:
-                # ── SCAN: run face recognition on every SCAN_SKIP-th frame ──
                 if frame_idx % SCAN_SKIP == 0:
                     t0 = time.time()
                     box, conf = match_frame(frame, ref_emb)
-                    elapsed = (time.time() - t0) * 1000
-                    print(f'[SCAN  #{frame_idx}] {elapsed:.0f}ms | found={box is not None}')
+                    print(f'[SCAN  #{frame_idx}] {(time.time()-t0)*1000:.0f}ms | found={box is not None}')
 
                     if box is not None:
-                        last_box  = box
-                        last_conf = conf
-                        detected  = True
-                        # Switch to TRACK mode
-                        mode    = MODE_TRACK
-                        tracker = init_tracker(frame, box)
-                        frames_since_verify = 0
-                        print(f'[INFO] Target ACQUIRED at frame {frame_idx} — switching to TRACK mode')
+                        last_box   = box.tolist() if hasattr(box, 'tolist') else list(box)
+                        last_conf  = conf
+                        detected   = True
+                        miss_count = 0
+                        mode       = MODE_TRACK
+                        print(f'[INFO] Target ACQUIRED @frame {frame_idx} — entering ROI-TRACK mode')
 
                         detections.append({'frame': frame_idx, 'timestamp': ts,
                                            'confidence': round(conf, 1)})
                         if len(thumbnails) < 8:
-                            crop = crop_to_box(frame, box)
-                            if crop.size > 0:
-                                thumb = cv2.resize(crop, (120, 120))
-                                _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                                thumbnails.append({'data': base64.b64encode(buf).decode(),
-                                                   'timestamp': ts, 'confidence': round(conf, 1)})
+                            d = save_thumbnail(frame, last_box)
+                            if d:
+                                thumbnails.append({'data': d, 'timestamp': ts,
+                                                   'confidence': round(conf, 1)})
 
-            else:  # MODE_TRACK
-                # ── TRACK: update OpenCV tracker ──────────────────────────
-                ok, rect = tracker.update(frame)
-                frames_since_verify += 1
+            # ── PHASE 2: TRACK — ROI-crop face recognition ─────────────────
+            else:
+                if frame_idx % ROI_SKIP == 0:
+                    rx1, ry1, rx2, ry2 = padded_roi(last_box, ROI_PAD, OW, OH)
+                    roi = frame[ry1:ry2, rx1:rx2]
 
-                if ok:
-                    x, y, w, h = [int(v) for v in rect]
-                    tracked_box = [x, y, x + w, y + h]
+                    box_in_roi, conf = match_frame(roi, ref_emb)
+                    print(f'[TRACK #{frame_idx}] ROI={rx1},{ry1}-{rx2},{ry2} | found={box_in_roi is not None}')
 
-                    # Periodic identity re-verification
-                    if frames_since_verify >= VERIFY_EVERY:
-                        frames_since_verify = 0
-                        crop = crop_to_box(frame, tracked_box)
-                        if crop.size > 0:
-                            embs = face_app.get(crop)
-                            verified = False
-                            if embs:
-                                emb = embs[0].embedding
-                                emb = emb / np.linalg.norm(emb)
-                                sim = float(np.dot(ref_emb, emb))
-                                if sim > THRESH:
-                                    verified = True
-                                    last_conf = sim_to_conf(sim)
-                            if not verified:
-                                print(f'[INFO] Re-verify FAILED at frame {frame_idx} — reverting to SCAN mode')
-                                mode    = MODE_SCAN
-                                tracker = None
-                                last_box = None
-                                timeline.append({'frame': frame_idx, 'timestamp': ts, 'detected': False})
-                                frame_idx += 1
-                                writer_proc.stdin.write(frame.tobytes())
-                                continue
+                    if box_in_roi is not None:
+                        # Translate box from ROI coords → full-frame coords
+                        bx1,by1,bx2,by2 = box_in_roi
+                        full_box = [rx1+bx1, ry1+by1, rx1+bx2, ry1+by2]
+                        last_box  = full_box
+                        last_conf = conf
+                        detected  = True
+                        miss_count = 0
 
-                    last_box = tracked_box
-                    detected = True
-                    t0 = time.time()
-                    print(f'[TRACK #{frame_idx}] {(time.time()-t0)*1000:.0f}ms | box={tracked_box}')
-                    detections.append({'frame': frame_idx, 'timestamp': ts,
-                                       'confidence': round(last_conf, 1)})
-                    if len(thumbnails) < 8:
-                        crop = crop_to_box(frame, tracked_box)
-                        if crop.size > 0:
-                            thumb = cv2.resize(crop, (120, 120))
-                            _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                            thumbnails.append({'data': base64.b64encode(buf).decode(),
-                                               'timestamp': ts, 'confidence': round(last_conf, 1)})
+                        detections.append({'frame': frame_idx, 'timestamp': ts,
+                                           'confidence': round(conf, 1)})
+                        if len(thumbnails) < 8:
+                            d = save_thumbnail(frame, last_box)
+                            if d:
+                                thumbnails.append({'data': d, 'timestamp': ts,
+                                                   'confidence': round(conf, 1)})
+                    else:
+                        # ROI miss — keep box visible but count miss
+                        miss_count += 1
+                        if miss_count >= MISS_LIMIT:
+                            print(f'[INFO] Target LOST after {miss_count} misses — reverting to SCAN')
+                            mode       = MODE_SCAN
+                            last_box   = None
+                            miss_count = 0
+                        else:
+                            # Still show last known box while searching
+                            detected = True
                 else:
-                    # Tracker lost the target — fall back to scan
-                    print(f'[INFO] Tracker LOST at frame {frame_idx} — reverting to SCAN mode')
-                    mode    = MODE_SCAN
-                    tracker = None
-                    last_box = None
+                    # Non-checked frame: carry previous box if we have one
+                    if last_box is not None:
+                        detected = True
 
             timeline.append({'frame': frame_idx, 'timestamp': ts, 'detected': detected})
 
-            # Draw bounding box if we have one
-            if last_box is not None and detected:
+            # Draw bounding box on frame
+            if detected and last_box is not None:
                 if first_det and detections:
                     first_det   = False
                     red_overlay = np.full_like(frame, (0, 0, 180))
